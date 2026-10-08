@@ -1,0 +1,32 @@
+services:
+  dashboard:
+    build: .
+    container_name: live-ids-dashboard
+    command: streamlit run app.py --server.address=0.0.0.0 --server.port=8501
+    ports:
+      - "8501:8501"
+    volumes:
+      - ./models:/app/models
+      - ./data:/app/data
+    restart: unless-stopped
+
+  sensor:
+    build: .
+    container_name: live-ids-sensor
+    command: python sensor.py
+    network_mode: host
+    cap_add:
+      - NET_RAW
+      - NET_ADMIN
+    environment:
+      IDS_INTERFACE: ${IDS_INTERFACE:-}
+      PCAP_FILE: ${PCAP_FILE:-}
+      FLOW_IDLE_TIMEOUT: ${FLOW_IDLE_TIMEOUT:-15}
+      FLOW_EMIT_SECONDS: ${FLOW_EMIT_SECONDS:-3}
+      STATE_FLUSH_SECONDS: ${STATE_FLUSH_SECONDS:-1}
+    volumes:
+      - ./models:/app/models:ro
+      - ./data:/app/data
+    depends_on:
+      - dashboard
+    restart: unless-stopped

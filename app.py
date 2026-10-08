@@ -4,6 +4,8 @@ import re
 import hashlib
 import time
 from datetime import datetime
+from pathlib import Path
+import json
 
 import numpy as np
 import pandas as pd
@@ -23,6 +25,8 @@ from sklearn.metrics import (
 
 import torch
 import torch.nn as nn
+
+from model_io import save_models, load_models, load_neural_state
 
 
 # ============================================================
@@ -558,6 +562,8 @@ def default_state():
         "traffic_file_signature": None,
         "traffic_preview": None,
         "adv_run_id": 0,
+        "live_stream": True,
+        "live_interval": 2.0,
     }
 
 
@@ -591,19 +597,31 @@ def reset_analysis_only():
 # ML HELPERS
 # ============================================================
 def find_target(df):
-    candidates = [
-        "label", "Label", "LABEL", "target", "Target", "class", "Class",
-        "y", "attack", "Attack"
-    ]
-    for c in candidates:
-        if c in df.columns:
-            return c
-    normalized = {
-        re.sub(r"[^a-z0-9]", "", str(c).lower()): c for c in df.columns
-    }
-    for key in ["label", "target", "class", "attack"]:
+    """Find the binary target column, including messy UNSW-NB15 mirrors."""
+    # First use exact/common names after normalizing punctuation, quotes and case.
+    normalized = {}
+    for c in df.columns:
+        key = re.sub(r"[^a-z0-9]", "", str(c).replace("\ufeff", "").strip().strip("\"'" ).lower())
+        normalized[key] = c
+
+    for key in ("label", "target", "class", "attack", "y"):
         if key in normalized:
             return normalized[key]
+
+    # UNSW-NB15 has 45 columns and the binary `label` is the final column.
+    # Some mirrors have a malformed/missing header but preserve the same layout.
+    # If the final column is actually binary 0/1, it is safe to treat it as label.
+    if len(df.columns) == 45:
+        last = df.columns[-1]
+        values = pd.to_numeric(df[last], errors="coerce").dropna()
+        if len(values) >= max(10, int(len(df) * 0.8)) and set(values.unique()).issubset({0, 1}):
+            return last
+
+    # More general fallback: find a column whose name contains label.
+    for c in df.columns:
+        norm = re.sub(r"[^a-z0-9]", "", str(c).lower())
+        if "label" in norm:
+            return c
     return None
 
 
@@ -719,6 +737,32 @@ def pgd_attack(model, X, y, epsilon, alpha, steps):
     return x.numpy()
 
 
+def restore_saved_model():
+    if st.session_state.trained:
+        return
+    loaded = load_models()
+    if loaded is None:
+        return
+    preprocessor, rf, metadata = loaded
+    st.session_state.preprocessor = preprocessor
+    st.session_state.rf = rf
+    st.session_state.feature_names = metadata.get("feature_names", [])
+    st.session_state.target_col = metadata.get("target_col", "label")
+    st.session_state.training_summary = metadata.get("training_summary", {})
+    st.session_state.train_filename = metadata.get("train_filename", "saved model")
+    st.session_state.trained = True
+
+    state = load_neural_state()
+    transformed_features = int(metadata.get("transformed_feature_count", 0))
+    if state is not None and transformed_features > 0:
+        try:
+            nn_model = MLP(transformed_features)
+            nn_model.load_state_dict(state)
+            st.session_state.torch_model = nn_model
+        except Exception:
+            st.session_state.torch_model = None
+
+
 def prepare_feature_frame(df):
     """Apply exactly the same feature-selection rules used during training."""
     target = st.session_state.target_col
@@ -734,6 +778,142 @@ def prepare_feature_frame(df):
         if c not in X.columns:
             X[c] = np.nan
     return X[st.session_state.feature_names]
+
+
+def read_uploaded_csv(uploaded_file):
+    """
+    Robust CSV loader for uploaded datasets.
+
+    Tries the common delimiters explicitly, then falls back to Python's
+    delimiter sniffing. This avoids the previous failure mode where a
+    valid UNSW-NB15 file was displayed as a single column.
+    """
+    if uploaded_file is None:
+        return None
+
+    raw = uploaded_file.getvalue()
+    if not raw:
+        raise ValueError("The uploaded CSV is empty.")
+
+    attempts = [
+        (",", "comma"),
+        ("\t", "tab"),
+        (";", "semicolon"),
+        ("|", "pipe"),
+    ]
+
+    best_df = None
+    best_cols = 0
+    best_delimiter = None
+
+    for delimiter, _name in attempts:
+        try:
+            df = pd.read_csv(
+                io.BytesIO(raw),
+                sep=delimiter,
+                engine="python",
+                encoding="utf-8-sig",
+                encoding_errors="replace",
+            )
+            if len(df.columns) > best_cols:
+                best_df = df
+                best_cols = len(df.columns)
+                best_delimiter = delimiter
+            if len(df.columns) >= 10:
+                break
+        except Exception:
+            continue
+
+    if best_df is None or best_cols <= 1:
+        try:
+            sniffed = pd.read_csv(
+                io.BytesIO(raw),
+                sep=None,
+                engine="python",
+                encoding="utf-8-sig",
+                encoding_errors="replace",
+            )
+            if len(sniffed.columns) > best_cols:
+                best_df = sniffed
+                best_cols = len(sniffed.columns)
+                best_delimiter = "auto"
+        except Exception:
+            pass
+
+    if best_df is None or len(best_df.columns) <= 1:
+        sample = raw[:500].decode("utf-8", errors="replace").replace("\n", "\\n")
+        raise ValueError(
+            "Could not parse the uploaded CSV into multiple columns. "
+            f"Detected {best_cols or 0} column. File sample: {sample}"
+        )
+
+    # Clean accidental whitespace/BOM/quote characters from column names.
+    # Some UNSW-NB15 mirrors contain headers such as \'label\', \"label\",
+    # or headers with a BOM/extra spaces. Normalize those here so target
+    # detection is reliable without changing the actual feature values.
+    cleaned_columns = []
+    for c in best_df.columns:
+        name = str(c).replace("\ufeff", "").strip()
+        name = name.strip('\"\'').strip()
+        cleaned_columns.append(name)
+    best_df.columns = cleaned_columns
+
+    # Canonicalize the common UNSW-NB15 target spelling.
+    normalized_target = {
+        re.sub(r"[^a-z0-9]", "", str(c).lower()): c
+        for c in best_df.columns
+    }
+    if "label" in normalized_target and normalized_target["label"] != "label":
+        best_df = best_df.rename(columns={normalized_target["label"]: "label"})
+
+    # A few mirrors are distributed without a proper header. If the parser
+    # produced exactly 45 columns and the last header itself looks like a
+    # binary value, reconstruct the canonical UNSW-NB15 header and reread the
+    # file as headerless. The official raw schema has `label` as column 45.
+    if len(best_df.columns) == 45 and find_target(best_df) is None:
+        last_header = str(best_df.columns[-1]).strip().strip("\"'")
+        if last_header in {"0", "1"}:
+            canonical = [
+                "id", "dur", "proto", "service", "state", "spkts", "dpkts",
+                "sbytes", "dbytes", "rate", "sttl", "dttl", "sload", "dload",
+                "sloss", "dloss", "sinpkt", "dinpkt", "sjit", "djit", "swin",
+                "stcpb", "dtcpb", "dwin", "tcprtt", "synack", "ackdat", "smean",
+                "dmean", "trans_depth", "response_body_len", "ct_srv_src",
+                "ct_state_ttl", "ct_dst_ltm", "ct_src_dport_ltm",
+                "ct_dst_sport_ltm", "ct_dst_src_ltm", "is_ftp_login", "ct_ftp_cmd",
+                "ct_flw_http_mthd", "ct_src_ltm", "ct_srv_dst", "is_sm_ips_ports",
+                "attack_cat", "label"
+            ]
+            try:
+                best_df = pd.read_csv(
+                    io.BytesIO(raw), header=None, names=canonical,
+                    sep=best_delimiter or ",", engine="python",
+                    encoding="utf-8-sig", encoding_errors="replace"
+                )
+            except Exception:
+                pass
+
+    return best_df
+
+
+def validate_training_dataset(df):
+    """Validate that the uploaded file looks like UNSW-NB15-style data."""
+    if df is None or df.empty:
+        raise ValueError("The training CSV is empty.")
+
+    if len(df.columns) <= 1:
+        raise ValueError(
+            "The CSV was parsed as a single column. Check the delimiter or download the UNSW-NB15 CSV again."
+        )
+
+    target = find_target(df)
+    if target is None:
+        raise ValueError(
+            "No target column was found. The training file must contain a label/class/target column; "
+            "for UNSW-NB15 the expected target is `label`."
+        )
+
+    return target
 
 
 def signature_file(uploaded_file):
@@ -899,6 +1079,113 @@ def get_category_counts(df):
     return result
 
 
+restore_saved_model()
+
+
+LIVE_BASE = Path(__file__).resolve().parent
+LIVE_DATA_DIR = LIVE_BASE / "data"
+LIVE_STATE_FILE = LIVE_DATA_DIR / "live_state.json"
+LIVE_ALERTS_FILE = LIVE_DATA_DIR / "live_alerts.jsonl"
+
+
+def read_live_state():
+    if not LIVE_STATE_FILE.exists():
+        return {"sensor_status": "OFFLINE", "packets_seen": 0, "active_flows": 0, "flows_scored": 0, "attacks": 0, "alerts": 0}
+    try:
+        return json.loads(LIVE_STATE_FILE.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return {"sensor_status": "UNKNOWN", "packets_seen": 0, "active_flows": 0, "flows_scored": 0, "attacks": 0, "alerts": 0}
+
+
+def read_live_alerts(limit=100):
+    if not LIVE_ALERTS_FILE.exists():
+        return pd.DataFrame()
+    try:
+        with LIVE_ALERTS_FILE.open("r", encoding="utf-8") as f:
+            lines = f.readlines()[-limit:]
+        rows = [json.loads(line) for line in lines if line.strip()]
+        return pd.DataFrame(rows)
+    except (OSError, json.JSONDecodeError):
+        return pd.DataFrame()
+
+
+def render_live_sensor():
+    header(
+        "Live Network Sensor",
+        "Real packet capture → flow aggregation → ML inference → analyst alerts.",
+        "📡",
+    )
+
+    if not st.session_state.trained:
+        st.warning("Train the IDS first. The saved model is required by the sensor container.")
+        st.info("After training, start the `sensor` service with Docker Compose. This page will begin updating automatically.")
+        return
+
+    state = read_live_state()
+    status = str(state.get("sensor_status", "OFFLINE")).upper()
+    online = status == "ONLINE"
+    dot = "dot-green" if online else "dot-amber"
+    status_text = "CAPTURE ENGINE ONLINE" if online else "CAPTURE ENGINE OFFLINE"
+
+    status_html = f"""
+    <div class='sidebar-status'>
+        <div class='status-title'><span class='status-dot {dot}'></span>{status_text}</div>
+        <div class='status-detail'>Interface: {state.get("interface", "auto")} · Last packet: {state.get("last_packet_at", "—")}</div>
+    </div>
+    """
+    st.markdown(status_html, unsafe_allow_html=True)
+
+    packets = int(state.get("packets_seen", 0) or 0)
+    active = int(state.get("active_flows", 0) or 0)
+    scored = int(state.get("flows_scored", 0) or 0)
+    attacks = int(state.get("attacks", 0) or 0)
+    attack_rate = (attacks / scored * 100) if scored else 0.0
+
+    render_card_row([
+        ("PACKETS SEEN", f"{packets:,}", "captured by sensor"),
+        ("ACTIVE FLOWS", f"{active:,}", "currently tracked"),
+        ("FLOWS SCORED", f"{scored:,}", "sent to ML model"),
+        ("ATTACKS", f"{attacks:,}", f"{attack_rate:.2f}% of scored flows"),
+    ])
+
+    st.markdown("<div class='section-label'>Live threat feed</div>", unsafe_allow_html=True)
+    alerts = read_live_alerts(100)
+    if alerts.empty:
+        st.info("No flow predictions have been written yet. Generate traffic and make sure the sensor container is running.")
+        return
+
+    display = alerts.copy()
+    if "attack_probability" in display.columns:
+        display["attack_probability"] = (pd.to_numeric(display["attack_probability"], errors="coerce") * 100).round(2)
+    if "timestamp" in display.columns:
+        display = display.sort_values("timestamp", ascending=False)
+
+    latest = display.head(12)
+    show = [c for c in ["timestamp", "srcip", "sport", "dstip", "dsport", "proto", "class_name", "attack_probability", "severity"] if c in latest.columns]
+    if show:
+        st.dataframe(latest[show], use_container_width=True, hide_index=True)
+
+    attacks_df = display[display.get("prediction", pd.Series(dtype=int)) == 1] if "prediction" in display.columns else pd.DataFrame()
+    if not attacks_df.empty:
+        st.markdown("<div class='section-label'>Latest alerts</div>", unsafe_allow_html=True)
+        render_alert_feed(
+            attacks_df.assign(
+                display_attack_type="Detected Attack",
+                attack_probability=pd.to_numeric(attacks_df["attack_probability"], errors="coerce"),
+            ),
+            limit=8,
+        )
+
+    if "attack_probability" in display.columns:
+        probs = pd.to_numeric(display["attack_probability"], errors="coerce").dropna()
+        if not probs.empty:
+            fig = px.histogram(probs, x=probs, nbins=20, title="Live attack-confidence distribution")
+            fig.update_xaxes(title="Attack probability")
+            fig.update_yaxes(title="Scored flows")
+            plot_theme(fig, 330)
+            st.plotly_chart(fig, use_container_width=True, key="live_confidence")
+
+
 # ============================================================
 # SIDEBAR
 # ============================================================
@@ -916,6 +1203,7 @@ page = st.sidebar.radio(
     "Workspace",
     [
         "Dashboard",
+        "Live Sensor",
         "Train Model",
         "Traffic Analyzer",
         "Adversarial Lab",
@@ -1147,6 +1435,19 @@ if page == "Dashboard":
 
 
 # ============================================================
+# LIVE SENSOR
+# ============================================================
+elif page == "Live Sensor":
+    if hasattr(st, "fragment"):
+        @st.fragment(run_every=2)
+        def live_fragment():
+            render_live_sensor()
+        live_fragment()
+    else:
+        render_live_sensor()
+
+
+# ============================================================
 # TRAIN MODEL
 # ============================================================
 # TRAIN MODEL
@@ -1154,7 +1455,7 @@ if page == "Dashboard":
 elif page == "Train Model":
     header(
         "Train the IDS",
-        "Build the detection engine from labelled network-flow data. Your trained model stays loaded while you move between workspace tabs.",
+        "Build the detection engine from labelled network-flow data. The uploader automatically detects common CSV delimiters and validates the UNSW-NB15 label column.",
         "🧠",
     )
 
@@ -1169,18 +1470,27 @@ elif page == "Train Model":
     if train_file is not None:
         sig = signature_file(train_file)
         if sig != st.session_state.train_file_signature:
-            df = pd.read_csv(train_file)
+            df = read_uploaded_csv(train_file)
             st.session_state.train_file_signature = sig
             st.session_state.train_filename = train_file.name
             st.session_state.train_preview = df.head(100).copy()
 
-            target = find_target(df)
+            try:
+                target = validate_training_dataset(df)
+                st.session_state.training_summary["upload_error"] = None
+            except ValueError as e:
+                target = None
+                st.session_state.training_summary["upload_error"] = str(e)
+
             st.session_state.training_summary["uploaded_rows"] = len(df)
             st.session_state.training_summary["uploaded_columns"] = len(df.columns)
             st.session_state.training_summary["uploaded_target"] = target
 
     summary = st.session_state.training_summary
     target = summary.get("uploaded_target")
+
+    if summary.get("upload_error"):
+        st.error(summary["upload_error"])
 
     if st.session_state.train_filename:
         st.markdown(
@@ -1204,7 +1514,11 @@ elif page == "Train Model":
     if target is None and st.session_state.trained:
         target = st.session_state.target_col
 
-    if target is not None and st.session_state.train_preview is not None:
+    if (
+        target is not None
+        and st.session_state.train_preview is not None
+        and target in st.session_state.train_preview.columns
+    ):
         preview = st.session_state.train_preview
         render_card_row([
             ("ROWS", f"{summary.get('uploaded_rows', len(preview)): ,}".replace(" ", ""), "training records"),
@@ -1237,10 +1551,16 @@ elif page == "Train Model":
 
         if st.button("🚀 Train / Replace IDS Model", type="primary", use_container_width=True):
             # Re-read the uploaded file from the current widget. Training itself happens once.
-            df = pd.read_csv(train_file) if train_file is not None else None
+            df = read_uploaded_csv(train_file) if train_file is not None else None
             if df is None:
                 st.warning("The training file is no longer attached to this page. Upload it again to retrain. The existing trained model is still available.")
             else:
+                try:
+                    target = validate_training_dataset(df)
+                except ValueError as e:
+                    st.error(str(e))
+                    st.stop()
+
                 with st.spinner("Preprocessing data and training Random Forest + neural IDS..."):
                     y, _ = binary_target(df[target])
                     X = df.drop(columns=[target]).copy()
@@ -1283,13 +1603,26 @@ elif page == "Train Model":
                     st.session_state.train_preview = df.head(100).copy()
                     reset_analysis_only()
 
-                st.success("IDS trained successfully. You can now analyze unseen traffic.")
+                    save_models(
+                        preprocessor=pre,
+                        rf=rf,
+                        nn_model=nn_model,
+                        metadata={
+                            "feature_names": st.session_state.feature_names,
+                            "target_col": target,
+                            "transformed_feature_count": int(Xp.shape[1]),
+                            "training_summary": st.session_state.training_summary,
+                            "train_filename": train_file.name,
+                        },
+                    )
+
+                st.success("IDS trained successfully and saved to models/. The live sensor can now load it.")
                 pred = rf.predict(Xp)
                 prob = rf.predict_proba(Xp)[:, 1]
                 metric_cards(y, pred, prob)
 
     elif not st.session_state.trained:
-        st.info("Upload your labelled training CSV above to inspect it and train the IDS.")
+        st.info("Upload a valid labelled CSV above. For UNSW-NB15, the file should contain multiple columns and a `label` column.")
     else:
         st.info("Your trained IDS is still loaded. Upload a new training CSV only if you want to replace it.")
 
@@ -1318,7 +1651,7 @@ elif page == "Traffic Analyzer":
         if f is not None:
             sig = signature_file(f)
             if sig != st.session_state.traffic_file_signature:
-                df_new = pd.read_csv(f)
+                df_new = read_uploaded_csv(f)
 
                 with st.spinner("Running traffic through the IDS..."):
                     X = prepare_feature_frame(df_new)
@@ -1646,7 +1979,8 @@ else:
         - FGSM and PGD feature-space adversarial experiments.
         - Confidence-based operational alert severity.
         - Source and attack-category investigation when those fields exist.
-        - CSV replay to simulate a live network feed for demonstration.
+        - Live packet capture with flow aggregation and ML inference.
+        - Dockerized sensor/dashboard separation for continuous monitoring.
         """,
         unsafe_allow_html=True,
     )
@@ -1655,4 +1989,4 @@ else:
     st.write("For UNSW-NB15, use `label` as the binary target: 0 = Normal and 1 = Attack. `attack_cat` is excluded from model inputs to avoid target leakage but can be displayed for investigation when present in an uploaded file.")
 
     st.markdown("### Important limitation")
-    st.warning("The live replay is a demonstration of an operational IDS workflow, not a packet-capture engine. FGSM/PGD operate on standardized feature vectors and do not guarantee packet-valid network attacks.")
+    st.warning("Live mode uses a separate packet-capture sensor and does not assign live ground-truth labels. Dataset evaluation remains the place for accuracy/precision/recall metrics. FGSM/PGD operate on standardized feature vectors and do not guarantee packet-valid network attacks.")
